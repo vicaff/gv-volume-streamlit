@@ -1,21 +1,20 @@
-import streamlit as st
-import pandas as pd
-import altair as alt
+import io
 from datetime import date, datetime
+
+import pandas as pd
+import streamlit as st
+import altair as alt
+
+# Extra libs for image export
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from PIL import Image
 
 st.set_page_config(page_title="G&V - Volumes (Toras, Cavaco & Lenha)", layout="wide")
 
 # ----------------------------- Helpers -----------------------------
 MESES = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
 UNITS_BY_TIPO = {"Toras": ["ST"], "Cavaco": ["TN", "m3"], "Lenha": ["ST", "m3", "TN"]}
-
-def to_date(s):
-    if isinstance(s, (date, datetime)):
-        return pd.to_datetime(s).date()
-    try:
-        return pd.to_datetime(str(s)).date()
-    except Exception:
-        return None
 
 def csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -62,16 +61,7 @@ cliente_sel = st.sidebar.selectbox("Cliente", ["Todos"] + clientes_all, index=0)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("CSV")
-st.sidebar.download_button(
-    "⬇️ Exportar CSV (filtrado)",
-    data=csv_bytes(df),  # substituído mais abaixo após filtragem real
-    file_name="gv_volumes_filtrado.csv",
-    mime="text/csv",
-    key="dl_placeholder",
-    disabled=True,
-    help="O botão real de exportação aparece abaixo da tabela principal."
-)
-
+st.sidebar.caption("A exportação principal fica no bloco da tabela.")
 # ----------------------------- Título -----------------------------
 st.title("📊 Cavaco, Toras & Lenha — Volume Diário (G&V)")
 
@@ -86,13 +76,14 @@ if cliente_sel != "Todos":
     df_use = df_use[df_use["Cliente"] == cliente_sel]
 
 # ----------------------------- Gráficos -----------------------------
-if df_use.empty:
-    st.info("Nenhum registro encontrado com os filtros selecionados.")
-else:
-    left, right = st.columns(2)
+left, right = st.columns(2)
 
-    with left:
-        st.subheader("📈 Acumulado do período (mês selecionado)")
+with left:
+    st.subheader("📈 Acumulado do período (mês selecionado)")
+    if df_use.empty:
+        st.info("Nenhum registro encontrado com os filtros selecionados.")
+        line = None
+    else:
         df_sorted = df_use.sort_values("Data").copy()
         df_sorted["Acumulado"] = df_sorted["Quantidade"].cumsum()
         line = alt.Chart(df_sorted).mark_line(point=True).encode(
@@ -102,14 +93,20 @@ else:
         )
         st.altair_chart(line, use_container_width=True)
 
-    with right:
-        st.subheader("🏆 Ranking por Cliente (mês selecionado)")
-        bar = alt.Chart(df_use.groupby("Cliente", as_index=False)["Quantidade"].sum()).mark_bar().encode(
+with right:
+    st.subheader("🏆 Ranking por Cliente (mês selecionado)")
+    if df_use.empty:
+        st.info("Nenhum registro para ranking.")
+        bar_data = pd.DataFrame(columns=["Cliente","Quantidade"])
+        bar_chart = None
+    else:
+        bar_data = df_use.groupby("Cliente", as_index=False)["Quantidade"].sum().sort_values("Quantidade", ascending=False)
+        bar_chart = alt.Chart(bar_data).mark_bar().encode(
             x=alt.X("Cliente:N", sort="-y"),
             y=alt.Y("Quantidade:Q"),
             tooltip=["Cliente","Quantidade"]
         )
-        st.altair_chart(bar, use_container_width=True)
+        st.altair_chart(bar_chart, use_container_width=True)
 
 # ----------------------------- CRUD: Lançamentos -----------------------------
 st.subheader("📋 Lançamentos do período filtrado")
@@ -118,8 +115,8 @@ colA, colB = st.columns([3,1])
 with colA:
     st.caption("Edite os valores diretamente na tabela abaixo. As mudanças são salvas em sessão.")
 with colB:
-    csv_data = csv_bytes(df_use[COLS])
-    st.download_button("⬇️ Exportar CSV (filtrado)", data=csv_data, file_name=f"gv_volumes_{ano_sel}-{mes_idx:02d}.csv", mime="text/csv")
+    csv_data = csv_bytes(df_use[COLS]) if not df_use.empty else b""
+    st.download_button("⬇️ Exportar CSV (filtrado)", data=csv_data, file_name=f"gv_volumes_{ano_sel}-{mes_idx:02d}.csv", mime="text/csv", disabled=df_use.empty)
 
 edited_df = st.data_editor(
     df_use[COLS],
@@ -135,16 +132,8 @@ edited_df = st.data_editor(
     key="editor_filtered",
 )
 
-# Sincroniza edições do editor filtrado de volta ao df global por (Data, Tipo, Cliente, Unidade, Quantidade, Status)
-# Estratégia: removemos do df global as linhas que pertencem ao filtro atual e substituímos pelas editadas.
-def apply_back_to_global(original_global: pd.DataFrame, filtered_original: pd.DataFrame, filtered_edited: pd.DataFrame) -> pd.DataFrame:
-    # Normaliza datas
-    filtered_original = filtered_original.copy()
-    filtered_edited = filtered_edited.copy()
-    filtered_original["Data"] = pd.to_datetime(filtered_original["Data"]).dt.date
-    filtered_edited["Data"] = pd.to_datetime(filtered_edited["Data"]).dt.date
-
-    # Conjunto que define o período filtrado no global para remoção
+def apply_back_to_global(original_global: pd.DataFrame, filtered_edited: pd.DataFrame) -> pd.DataFrame:
+    # Define o período atual e substitui pelas linhas editadas
     mask_period = (
         (pd.to_datetime(original_global["Data"]).dt.year == ano_sel) &
         (pd.to_datetime(original_global["Data"]).dt.month == mes_idx)
@@ -153,15 +142,12 @@ def apply_back_to_global(original_global: pd.DataFrame, filtered_original: pd.Da
         mask_period &= (original_global["Tipo"] == tipo_sel)
     if cliente_sel != "Todos":
         mask_period &= (original_global["Cliente"] == cliente_sel)
-
-    # Remove período do global
     remaining = original_global.loc[~mask_period].copy()
-    # Adiciona editadas
     merged = pd.concat([remaining, filtered_edited[COLS]], ignore_index=True)
     return merged
 
 if st.button("💾 Salvar alterações do período filtrado"):
-    st.session_state.df = apply_back_to_global(st.session_state.df, df_use[COLS], edited_df[COLS])
+    st.session_state.df = apply_back_to_global(st.session_state.df, edited_df[COLS])
     st.success("Alterações salvas no app (sessão atual).")
     st.rerun()
 
@@ -170,15 +156,14 @@ with st.expander("➕ Adicionar novo lançamento"):
     c1, c2, c3 = st.columns(3)
     with c1:
         nova_data = st.date_input("Data", value=date.today())
-        novo_tipo = st.selectbox("Tipo do produto", ["Toras","Cavaco","Lenha"], index=0)
+        novo_tipo = st.selectbox("Tipo do produto", ["Toras","Cavaco","Lenha"], index=0, key="novo_tipo")
     with c2:
-        # unidade condicionada ao tipo
         unidades = UNITS_BY_TIPO[novo_tipo]
-        nova_unidade = st.selectbox("Unidade", unidades, index=0)
-        nova_qtd = st.number_input("Quantidade", min_value=0.0, step=0.01)
+        nova_unidade = st.selectbox("Unidade", unidades, index=0, key="nova_unidade")
+        nova_qtd = st.number_input("Quantidade", min_value=0.0, step=0.01, key="nova_qtd")
     with c3:
-        novo_cliente = st.text_input("Cliente")
-        novo_status = st.selectbox("Status", ["ok","verificando"], index=0)
+        novo_cliente = st.text_input("Cliente", key="novo_cliente")
+        novo_status = st.selectbox("Status", ["ok","verificando"], index=0, key="novo_status")
 
     if st.button("Salvar novo lançamento"):
         if novo_cliente.strip() == "":
@@ -203,7 +188,6 @@ file = st.file_uploader("Selecione um arquivo CSV", type=["csv"])
 if file is not None:
     try:
         new = pd.read_csv(file)
-        # saneamento básico
         new = new[[c for c in COLS if c in new.columns]].copy()
         for c in COLS:
             if c not in new.columns:
@@ -217,7 +201,9 @@ if file is not None:
                     new[c] = ""
         new["Data"] = pd.to_datetime(new["Data"]).dt.date
         new["Quantidade"] = pd.to_numeric(new["Quantidade"], errors="coerce").fillna(0.0)
-        new["Status"] = new["Status"].str.lower().where(new["Status"].str.lower().isin(["ok","verificando"]), "ok")
+        new["Status"] = new["Status"].astype(str).str.lower().where(
+            new["Status"].astype(str).str.lower().isin(["ok","verificando"]), "ok"
+        )
 
         st.session_state.df = pd.concat([st.session_state.df, new[COLS]], ignore_index=True)
         st.success(f"Importado {len(new)} linha(s)!")
@@ -225,7 +211,55 @@ if file is not None:
     except Exception as e:
         st.error(f"Falha ao importar: {e}")
 
+# ----------------------------- Exportar IMAGEM (quadro + ranking) -----------------------------
+st.markdown("---")
+st.subheader("🖼️ Exportar imagem do quadro de clientes (ranking)")
+st.caption("Gera um PNG com o ranking de clientes (tabela e gráfico) para compartilhar em grupos/e-mail.")
+
+def build_share_image(bar_df: pd.DataFrame, title: str) -> bytes:
+    if bar_df.empty:
+        bar_df = pd.DataFrame({"Cliente": ["—"], "Quantidade": [0]})
+
+    # Ordena por quantidade desc
+    bar_df = bar_df.sort_values("Quantidade", ascending=False).reset_index(drop=True)
+
+    # Figura
+    fig = plt.figure(figsize=(10, 8), dpi=200)
+    fig.suptitle(title, fontsize=14, y=0.97)
+
+    # Subplot 1: Tabela
+    ax_table = fig.add_axes([0.06, 0.58, 0.88, 0.34])  # [left, bottom, width, height]
+    ax_table.axis('off')
+    table_data = [["Cliente", "Quantidade"]] + bar_df.values.tolist()
+    table = ax_table.table(cellText=table_data, loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1, 1.3)
+
+    # Subplot 2: Gráfico de barras
+    ax_bar = fig.add_axes([0.08, 0.08, 0.84, 0.42])
+    ax_bar.bar(bar_df["Cliente"], bar_df["Quantidade"])
+    ax_bar.set_ylabel("Quantidade")
+    ax_bar.set_xticklabels(bar_df["Cliente"], rotation=20, ha="right")
+
+    # Render para bytes
+    buf = io.BytesIO()
+    canvas = FigureCanvas(fig)
+    canvas.print_png(buf)
+    plt.close(fig)
+    return buf.getvalue()
+
+rank_title = f"G&V • Ranking por Cliente — {MESES[mes_idx-1].upper()}/{ano_sel}"
+png_bytes = build_share_image(bar_data[["Cliente","Quantidade"]] if not df_use.empty else pd.DataFrame(columns=["Cliente","Quantidade"]), rank_title)
+
+st.download_button(
+    "⬇️ Exportar imagem (PNG) do ranking",
+    data=png_bytes,
+    file_name=f"gv_ranking_{ano_sel}-{mes_idx:02d}.png",
+    mime="image/png",
+    disabled=df_use.empty
+)
+
 # ----------------------------- Rodapé -----------------------------
 st.markdown("---")
-st.caption("POC • G&V • Dados em sessão do Streamlit (não persistem após reiniciar o app). Para persistência real, posso plugar Google Sheets/Firestore.")
-
+st.caption("POC • G&V • Dados em sessão do Streamlit. Para persistência real (Google Sheets/Firestore) e agendamento de envios automáticos por e-mail/WhatsApp, posso integrar quando quiser.")
